@@ -89,21 +89,7 @@ export default async function RoomPage({
     }
   }
 
-  if (!me.joined_at) {
-    await supabase
-      .from("session_participants")
-      .update({ joined_at: new Date().toISOString() })
-      .eq("id", me.id);
-  }
-
-  if (!session.started_at) {
-    await supabase
-      .from("study_sessions")
-      .update({ status: "active", started_at: new Date().toISOString() })
-      .eq("id", sessionId);
-  }
-
-  const startedAt = session.started_at ?? new Date().toISOString();
+  const startedAt = session.started_at ?? null;
 
   return (
     <div className="space-y-5">

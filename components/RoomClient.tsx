@@ -19,7 +19,7 @@ interface RoomClientProps {
   subjectLabel: string;
   studyStyle: string;
   durationMinutes: number;
-  startedAt: string;
+  startedAt: string | null;
   initialStatus: string;
 }
 
@@ -40,39 +40,93 @@ export default function RoomClient({
   const [error, setError] = useState<string | null>(null);
   const [leaving, setLeaving] = useState(false);
   const [status, setStatus] = useState<string>(initialStatus);
+const [liveStartedAt, setLiveStartedAt] = useState<string | null>(startedAt);
+const [retryKey, setRetryKey] = useState(0);
+const leftRef = useRef(false);
+useEffect(() => {
+  let cancelled = false;
 
-  const leftRef = useRef(false);
+  const checkSession = async () => {
+    const { data, error } = await supabase
+      .from("study_sessions")
+      .select("started_at, status")
+      .eq("id", sessionId)
+      .maybeSingle();
+
+    if (cancelled || error || !data) return;
+
+    setLiveStartedAt(data.started_at ?? null);
+    setStatus(data.status);
+  };
+
+  void checkSession();
+
+  const interval = setInterval(() => {
+    void checkSession();
+  }, 2000);
+
+  return () => {
+    cancelled = true;
+    clearInterval(interval);
+  };
+}, [sessionId, supabase]);
+  const handleConnected = useCallback(async () => {
+    try {
+      const response = await fetch("/api/study-sessions/ready", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || "Could not confirm your connection.");
+      }
+
+      if (result.bothConnected) {
+        setStatus("active");
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not confirm your study session is ready."
+      );
+    }
+  }, [sessionId]);
 
   useEffect(() => {
     let cancelled = false;
 
     async function fetchToken() {
+      setError(null);
+
       try {
-        const res = await fetch("/api/livekit/token", {
+        const response = await fetch("/api/livekit/token", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ sessionId }),
         });
 
-        if (!res.ok) {
-          const payload = (await res.json().catch(() => ({}))) as {
-            error?: string;
-          };
-          throw new Error(payload.error ?? "Failed to obtain LiveKit token");
+        const json = await response.json();
+
+        if (!response.ok || !json.token || !json.url) {
+          throw new Error(
+            json.error || "LiveKit is not configured correctly."
+          );
         }
 
-        const json = (await res.json()) as { token: string; url: string };
-        if (cancelled) return;
-
-        if (!json.token || !json.url) {
-          throw new Error("LiveKit is not configured correctly.");
+        if (!cancelled) {
+          setToken(json.token);
+          setServerUrl(json.url);
         }
-
-        setToken(json.token);
-        setServerUrl(json.url);
       } catch (err) {
         if (cancelled) return;
-        setError(err instanceof Error ? err.message : "Unknown error");
+
+        setError(
+          err instanceof Error ? err.message : "Unknown error"
+        );
       }
     }
 
@@ -81,10 +135,11 @@ export default function RoomClient({
     return () => {
       cancelled = true;
     };
-  }, [sessionId]);
+  }, [sessionId, retryKey]);
 
   const handleLeave = useCallback(async () => {
     if (leftRef.current) return;
+
     leftRef.current = true;
     setLeaving(true);
 
@@ -99,22 +154,27 @@ export default function RoomClient({
 
       const { data: participants } = await supabase
         .from("session_participants")
-        .select("*")
+        .select("left_at")
         .eq("session_id", sessionId);
 
-      const rows = (participants ?? []) as Array<{ left_at: string | null }>;
+      const rows = participants ?? [];
       const everyoneLeft =
-        rows.length > 0 && rows.every((row) => row.left_at !== null);
+        rows.length > 0 &&
+        rows.every((row) => row.left_at !== null);
 
       if (everyoneLeft) {
         await supabase
           .from("study_sessions")
-          .update({ status: "completed", ended_at: now })
+          .update({
+            status: "completed",
+            ended_at: now,
+          })
           .eq("id", sessionId);
+
         setStatus("completed");
       }
     } catch {
-      // best-effort; continue to feedback
+      // Continue to feedback even if updating the session fails.
     }
 
     router.push(`/feedback/${sessionId}`);
@@ -127,13 +187,22 @@ export default function RoomClient({
         <p className="text-sm font-semibold text-rose-700">
           Could not join the study room
         </p>
-        <p className="mt-1 text-sm text-rose-600">{error}</p>
+
+        <p className="mt-1 text-sm text-rose-600">
+          {error}
+        </p>
+
         <div className="mt-4 flex justify-center gap-3">
-          <Button variant="secondary" onClick={() => router.refresh()}>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              setError(null);
+              setToken(null);
+              setServerUrl(null);
+              setRetryKey((key) => key + 1);
+            }}
+          >
             Retry
-          </Button>
-          <Button variant="ghost" onClick={() => router.push("/dashboard")}>
-            Back to dashboard
           </Button>
         </div>
       </div>
@@ -141,16 +210,17 @@ export default function RoomClient({
   }
 
   return (
-    <div className="space-y-5">
-      <div className="grid grid-cols-1 gap-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:grid-cols-3">
+    <div className="space-y-6">
+      <div className="grid gap-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:grid-cols-3">
         <div>
           <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
             Subject
           </p>
-          <p className="mt-1 truncate text-sm font-medium text-slate-900">
+          <p className="mt-1 text-sm font-medium text-slate-900">
             {subjectLabel}
           </p>
         </div>
+
         <div>
           <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
             Study style
@@ -159,6 +229,7 @@ export default function RoomClient({
             {studyStyle}
           </p>
         </div>
+
         <div>
           <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
             Status
@@ -169,23 +240,32 @@ export default function RoomClient({
         </div>
       </div>
 
-      <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-        <StudyTimer startedAt={startedAt} durationMinutes={durationMinutes} />
-      </div>
+  <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+  <StudyTimer
+    startedAt={liveStartedAt}
+    durationMinutes={durationMinutes}
+  />
+</div>
 
-      <div
-        data-lk-theme="default"
-        className="overflow-hidden rounded-2xl border border-slate-200 bg-slate-900 shadow-sm"
-        style={{ height: "62vh", minHeight: "380px" }}
-      >
+<div
+  data-lk-theme="default"
+  className="overflow-hidden rounded-2xl border border-slate-200 bg-slate-900 shadow-sm"
+  style={{ height: "62vh", minHeight: "380px" }}
+>
         {token && serverUrl ? (
           <LiveKitRoom
+            key={retryKey}
             token={token}
             serverUrl={serverUrl}
             connect
             audio
             video
-            onDisconnected={handleLeave}
+            onConnected={handleConnected}
+            onDisconnected={() => {
+              setError(
+                "Your connection to the study room was interrupted. Please try reconnecting."
+              );
+            }}
             style={{ height: "100%" }}
           >
             <VideoConference />
